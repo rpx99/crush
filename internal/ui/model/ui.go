@@ -237,10 +237,6 @@ type UI struct {
 	// by setInputMode is still in flight; sending is blocked meanwhile.
 	modeSwitching bool
 
-	// cycleYolo is true while YOLO was enabled by the Shift+Tab input-mode
-	// cycle, which is the only case where the cycle may disable it again.
-	cycleYolo bool
-
 	keyMap KeyMap
 	keyenh tea.KeyboardEnhancementsMsg
 
@@ -3297,7 +3293,7 @@ func (m *UI) Draw(scr uv.Screen, area uv.Rectangle) *tea.Cursor {
 
 	// Add status and help layer
 	m.status.SetHideHelp(isOnboarding)
-	m.status.SetMode(m.mode, m.yoloActive())
+	m.status.SetMode(m.mode, m.permModeCached())
 	m.status.Draw(scr, layout.status)
 
 	// Draw completions popup if open
@@ -4195,9 +4191,6 @@ func (m *UI) setPermissionMode(mode permission.PermissionMode) {
 	// re-dispatches the stale probe.
 	m.busyFetchGen++
 	m.setEditorPrompt(mode)
-	// Any explicit write hands YOLO ownership back to the user; the
-	// Shift+Tab cycle re-claims it right after its own call.
-	m.cycleYolo = false
 }
 
 // setYolo turns YOLO on or off. Turning it off goes all the way back to
@@ -4338,22 +4331,32 @@ func (m *UI) bangPromptFunc(info textarea.PromptInfo) string {
 	return t.Editor.PromptBangDotsBlurred.Render()
 }
 
+// toggleInputMode advances the Shift+Tab cycle by one position. The cycle is
+// a ring of four positions read straight off the current state — code ->
+// plan -> YOLO -> sysadmin -> code. Nothing is remembered between presses,
+// so the next position is always the one the badge implies, whether the
+// permission mode came from this cycle or from Ctrl+Y.
 func (m *UI) toggleInputMode() tea.Cmd {
 	if m.isAgentBusy() || m.modeSwitching {
 		return util.ReportWarn("Agent is busy, please wait before switching input mode...")
 	}
 	if m.mode == uiInputModePlan {
-		// Second step of the Shift+Tab cycle: plan -> YOLO. Enabling YOLO
-		// here is the only case where the cycle may disable it again.
+		// Second step: plan -> YOLO coding. A permissive mode carried into
+		// plan keeps its rung rather than being knocked down to plain YOLO.
 		if !m.yoloActive() {
 			m.setYolo(true)
-			m.cycleYolo = true
 		}
 		return m.setInputMode(uiInputModeCode)
 	}
-	// Only the cycle may turn YOLO back off: YOLO the user enabled himself
-	// (Ctrl+Y, the command palette) survives entering plan mode.
-	if m.yoloActive() && m.cycleYolo {
+	if m.yoloActive() {
+		if m.permModeCached() == permission.PermissionModeYolo {
+			// Third step: YOLO -> sysadmin. The banner spells out what was
+			// just given up, since this is the most permissive state the
+			// program has and it is now one keystroke away.
+			m.setPermissionMode(permission.PermissionModeSysadmin)
+			return util.CmdHandler(util.InfoMsg{Type: util.InfoTypeSysadmin, Msg: sysadminModeBannerMsg})
+		}
+		// Fourth step: sysadmin -> normal, closing the cycle.
 		m.setYolo(false)
 		return util.ReportInfo("input mode: code")
 	}
@@ -4374,16 +4377,14 @@ func (m *UI) switchPlanToYolo() tea.Cmd {
 	if !m.yoloActive() {
 		m.setYolo(true)
 	}
-	// Explicit activation pins YOLO: the Shift+Tab cycle must not disable
-	// it on the next pass.
-	m.cycleYolo = false
 	return m.setInputMode(uiInputModeCode)
 }
 
 // Mode banner copy shown in the status bar after switching modes.
 const (
-	planModeBannerMsg = "Plan with Crush before generating any code."
-	yoloModeBannerMsg = "Skip permission prompts. System level commands will be blocked."
+	planModeBannerMsg     = "Plan with Crush before generating any code."
+	yoloModeBannerMsg     = "Skip permission prompts. System level commands will be blocked."
+	sysadminModeBannerMsg = "All commands are unblocked. Use carefully."
 )
 
 func (m *UI) setInputMode(target uiInputMode) tea.Cmd {
@@ -4392,9 +4393,13 @@ func (m *UI) setInputMode(target uiInputMode) tea.Cmd {
 		agentID = config.AgentCoder
 	}
 
-	// YOLO is orthogonal to the input mode, so report it alongside the mode
-	// instead of treating a YOLO-enabled coder as plain "code".
-	yolo := target == uiInputModeCode && m.yoloActive()
+	// The permission mode is orthogonal to the input mode, so report it
+	// alongside the mode instead of treating a YOLO-enabled coder as plain
+	// "code".
+	perm := permission.PermissionModeNormal
+	if target == uiInputModeCode {
+		perm = m.permModeCached()
+	}
 
 	// The agent switch is an HTTP round-trip in client/server mode, so it
 	// runs off the update loop together with the model update. The mode and
@@ -4409,7 +4414,7 @@ func (m *UI) setInputMode(target uiInputMode) tea.Cmd {
 		}
 		return modeSwitchedMsg{
 			mode: target,
-			yolo: yolo,
+			perm: perm,
 			err:  err,
 		}
 	}
@@ -4431,7 +4436,9 @@ func (m *UI) applyModeSwitch(msg modeSwitchedMsg) []tea.Cmd {
 	switch {
 	case msg.mode == uiInputModePlan:
 		cmds = append(cmds, util.CmdHandler(util.InfoMsg{Type: util.InfoTypePlan, Msg: planModeBannerMsg}))
-	case msg.yolo:
+	case msg.perm == permission.PermissionModeSysadmin:
+		cmds = append(cmds, util.CmdHandler(util.InfoMsg{Type: util.InfoTypeSysadmin, Msg: sysadminModeBannerMsg}))
+	case msg.perm == permission.PermissionModeYolo:
 		cmds = append(cmds, util.CmdHandler(util.InfoMsg{Type: util.InfoTypeYolo, Msg: yoloModeBannerMsg}))
 	default:
 		cmds = append(cmds, util.ReportInfo("input mode: code"))
@@ -4444,7 +4451,7 @@ func (m *UI) applyModeSwitch(msg modeSwitchedMsg) []tea.Cmd {
 type modeSwitchedMsg struct {
 	continueSessionID string
 	mode              uiInputMode
-	yolo              bool
+	perm              permission.PermissionMode
 	err               error
 }
 
