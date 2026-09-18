@@ -2344,11 +2344,17 @@ func (m *UI) refreshHyperAndRetrySelect(msg dialog.ActionSelectModel) tea.Cmd {
 // updateHyperCredits refreshes the displayed Hyper balance from the most
 // recent API response, when one has reported a balance. It is a pure
 // in-memory read, so it is safe to call on every session update.
+//
+// A missing balance never clears the displayed value: responses that carry
+// no hypercredit figure would otherwise blank the readout on every update
+// until the fallback fetch fills it in again.
 func (m *UI) updateHyperCredits() {
 	if !m.com.IsHyper() {
 		return
 	}
-	m.hyperCredits = hyper.Balance()
+	if balance := hyper.Balance(); balance != nil {
+		m.hyperCredits = balance
+	}
 }
 
 // fetchHyperCredits returns a command that resolves the remaining Hyper
