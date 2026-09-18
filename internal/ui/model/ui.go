@@ -5272,10 +5272,6 @@ func (m *UI) handleAgentNotification(n notify.Notification) tea.Cmd {
 			Title:   "Crush is waiting...",
 			Message: fmt.Sprintf("Agent's turn completed in \"%s\"", n.SessionTitle),
 		}))
-		m.updateHyperCredits()
-		if m.com.IsHyper() {
-			cmds = append(cmds, m.fetchHyperCredits())
-		}
 	case notify.TypeAgentError:
 		// Terminal edge like TypeAgentFinished; fall through to the
 		// busy/queue refresh below.
@@ -5287,6 +5283,12 @@ func (m *UI) handleAgentNotification(n notify.Notification) tea.Cmd {
 		return m.handleAWSSSOAuthResult(n.Message)
 	default:
 		return nil
+	}
+	// Both terminal edges refresh the credit readout: a failed turn can
+	// still have spent credits, and the responses may carry no balance.
+	m.updateHyperCredits()
+	if m.com.IsHyper() {
+		cmds = append(cmds, m.fetchHyperCredits())
 	}
 	// TypeAgentFinished / TypeAgentError are the busy→idle edge: the agent
 	// clears its active request before publishing precisely so observers
