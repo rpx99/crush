@@ -1890,8 +1890,9 @@ func (a *sessionAgent) openrouterCost(metadata fantasy.ProviderMetadata) *float6
 }
 
 // extractHyperCredits reads usage.remaining.hypercredits from OpenAI
-// provider metadata — present on every Hyper chat completion, streamed or
-// not — and stores the reported balance for the UI to display.
+// provider metadata and stores the reported balance for the UI to display.
+// A zero balance is stored as well, so an exhausted account renders as 0
+// instead of keeping the last positive value.
 func extractHyperCredits(metadata fantasy.ProviderMetadata) {
 	openaiMeta, ok := metadata[openai.Name]
 	if !ok {
@@ -1908,7 +1909,7 @@ func extractHyperCredits(metadata fantasy.ProviderMetadata) {
 		slog.Debug("Hyper usage metadata has no remaining balance", "extra_fields", pm.ExtraFields)
 		return
 	}
-	if remaining.Hypercredits > 0 {
+	if remaining.Hypercredits >= 0 {
 		hyper.SetBalance(int(math.Round(remaining.Hypercredits)))
 		slog.Debug("Hyper balance from response metadata", "hypercredits", remaining.Hypercredits)
 	}
