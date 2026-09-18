@@ -1904,8 +1904,13 @@ func extractHyperCredits(metadata fantasy.ProviderMetadata) {
 	var remaining struct {
 		Hypercredits float64 `json:"hypercredits"`
 	}
-	if pm.ExtraField("remaining", &remaining) && remaining.Hypercredits > 0 {
+	if !pm.ExtraField("remaining", &remaining) {
+		slog.Debug("Hyper usage metadata has no remaining balance", "extra_fields", pm.ExtraFields)
+		return
+	}
+	if remaining.Hypercredits > 0 {
 		hyper.SetBalance(int(math.Round(remaining.Hypercredits)))
+		slog.Debug("Hyper balance from response metadata", "hypercredits", remaining.Hypercredits)
 	}
 }
 

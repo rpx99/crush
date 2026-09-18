@@ -176,6 +176,12 @@ type (
 	sessionFilesUpdatesMsg struct {
 		sessionFiles []SessionFile
 	}
+	// creditsUpdatedMsg is sent when the remaining Hyper credits have been
+	// resolved. credits is nil when the team has hypercredit display
+	// disabled.
+	creditsUpdatedMsg struct {
+		credits *int
+	}
 )
 
 // UI represents the main user interface model.
@@ -578,6 +584,9 @@ func (m *UI) Init() tea.Cmd {
 	// session load then queues behind on the single connection.
 	if initialSession == nil {
 		cmds = append(cmds, m.loadPromptHistory())
+	}
+	if m.com.IsHyper() {
+		cmds = append(cmds, m.fetchHyperCredits())
 	}
 	// Prime the ChatGPT model catalog: a signed-in OpenAI provider
 	// whose catalog is missing (the fetch at login failed, or the
@@ -1422,6 +1431,8 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if cmd := m.handleSelectModel(msg.action); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
+	case creditsUpdatedMsg:
+		m.hyperCredits = msg.credits
 	case util.InfoMsg:
 		if msg.Type == util.InfoTypeError {
 			slog.Error("Error reported", "error", msg.Msg)
@@ -2331,14 +2342,60 @@ func (m *UI) refreshHyperAndRetrySelect(msg dialog.ActionSelectModel) tea.Cmd {
 }
 
 // updateHyperCredits refreshes the displayed Hyper balance from the most
-// recent API response. Every Hyper chat completion reports the balance in
-// its usage block, so there is nothing to fetch: until the first response
-// of the session arrives the balance is unknown and stays hidden.
+// recent API response, when one has reported a balance. It is a pure
+// in-memory read, so it is safe to call on every session update.
 func (m *UI) updateHyperCredits() {
 	if !m.com.IsHyper() {
 		return
 	}
 	m.hyperCredits = hyper.Balance()
+}
+
+// fetchHyperCredits returns a command that resolves the remaining Hyper
+// credits without blocking the UI. It prefers a balance already reported
+// by an API response's usage metadata and only falls back to the
+// /v1/credits endpoint when no response has reported one yet.
+func (m *UI) fetchHyperCredits() tea.Cmd {
+	return func() tea.Msg {
+		var (
+			apiKey      string
+			cfg         *config.Config
+			providerCfg config.ProviderConfig
+		)
+		getAPIKey := func() (ok bool) {
+			if cfg = m.com.Config(); cfg == nil {
+				return false
+			}
+			if providerCfg, ok = cfg.Providers.Get(hyper.Name); !ok {
+				return false
+			}
+			var err error
+			apiKey, err = m.com.Workspace.Resolver().ResolveValue(providerCfg.APIKey)
+			return err == nil && apiKey != ""
+		}
+		if !getAPIKey() {
+			return nil
+		}
+
+		if providerCfg.OAuthToken != nil && providerCfg.OAuthToken.IsExpired() {
+			ctxRefresh, cancelRefresh := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancelRefresh()
+			if err := m.com.Workspace.RefreshOAuthToken(ctxRefresh, config.ScopeGlobal, hyper.Name); err != nil {
+				slog.Warn("Hyper OAuth refresh failed before fetching credits, trying with existing token", "error", err)
+			} else if !getAPIKey() {
+				return nil
+			}
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		credits, err := hyper.FetchCredits(ctx, apiKey)
+		if err != nil {
+			slog.Error("Failed to fetch Hyper credits", "error", err)
+			return nil
+		}
+		return creditsUpdatedMsg{credits: credits}
+	}
 }
 
 // restoreModelFromSession checks the last assistant message in the
@@ -2530,6 +2587,7 @@ func (m *UI) handleSelectModel(msg dialog.ActionSelectModel) tea.Cmd {
 		}
 	} else if m.com.IsHyper() {
 		m.updateHyperCredits()
+		cmds = append(cmds, m.fetchHyperCredits())
 	}
 
 	return tea.Batch(cmds...)
@@ -5209,6 +5267,9 @@ func (m *UI) handleAgentNotification(n notify.Notification) tea.Cmd {
 			Message: fmt.Sprintf("Agent's turn completed in \"%s\"", n.SessionTitle),
 		}))
 		m.updateHyperCredits()
+		if m.com.IsHyper() {
+			cmds = append(cmds, m.fetchHyperCredits())
+		}
 	case notify.TypeAgentError:
 		// Terminal edge like TypeAgentFinished; fall through to the
 		// busy/queue refresh below.
