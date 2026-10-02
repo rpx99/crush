@@ -61,7 +61,8 @@ type BackgroundShell struct {
 
 // BackgroundShellManager manages background shell instances.
 type BackgroundShellManager struct {
-	shells *csync.Map[string, *BackgroundShell]
+	startMu sync.Mutex
+	shells  *csync.Map[string, *BackgroundShell]
 }
 
 var (
@@ -87,9 +88,29 @@ func GetBackgroundShellManager() *BackgroundShellManager {
 
 // Start creates and starts a new background shell with the given command.
 func (m *BackgroundShellManager) Start(ctx context.Context, workingDir string, blockFuncs []BlockFunc, command string, description string) (*BackgroundShell, error) {
-	// Check job limit
-	if m.shells.Len() >= MaxBackgroundJobs {
-		return nil, fmt.Errorf("maximum number of background jobs (%d) reached. Please terminate or wait for some jobs to complete", MaxBackgroundJobs)
+	// Keep admission atomic when multiple tools start jobs concurrently.
+	m.startMu.Lock()
+	defer m.startMu.Unlock()
+
+	m.Cleanup()
+	// Preserve recent output while there is room. At capacity, evict only
+	// the oldest completed job so retained history cannot block execution.
+	for m.shells.Len() >= MaxBackgroundJobs {
+		var oldest *BackgroundShell
+		for shell := range m.shells.Seq() {
+			if !shell.IsDone() {
+				continue
+			}
+			if oldest == nil || shell.completedAt.Load() < oldest.completedAt.Load() {
+				oldest = shell
+			}
+		}
+		if oldest == nil {
+			return nil, fmt.Errorf("maximum number of running background jobs (%d) reached. Please terminate or wait for some jobs to complete", MaxBackgroundJobs)
+		}
+		if removed, ok := m.shells.Take(oldest.ID); ok {
+			removed.cancel()
+		}
 	}
 
 	id := fmt.Sprintf("%03X", idCounter.Add(1))
